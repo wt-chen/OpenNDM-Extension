@@ -211,7 +211,7 @@ export class NdmClient {
    * 发送消息；waitMs > 0 时等待连接建立。
    * Send a message; waitMs > 0 waits briefly for the socket.
    */
-  async send(payload, { waitMs = 0 } = {}) {
+  async send(payload, { waitMs = 0, shouldSend = null } = {}) {
     const message = buildNdmMessage(payload);
     if (!message) {
       this.lastError = 'Message too large';
@@ -229,6 +229,8 @@ export class NdmClient {
     }
 
     try {
+      // 放行浏览器后，迟到的异步任务不得再发送 / Never send after the browser was released.
+      if (shouldSend && !shouldSend()) return false;
       this.lastPayload = payload;
       this.socket.send(message);
       return true;

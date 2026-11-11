@@ -108,7 +108,11 @@ content script ── MEDIA_FOUND ─► mediaByTab ──► 面板渲染（点
 
 `sendToNdm()` 成功后写入 `recentSent`（12 s 去重）与 `pendingCancel`（15 s，供兜底路径取消浏览器副本），并广播 `STATE_CHANGED`。
 
-### 4.2 浏览器下载兜底（`downloads.onCreated`）
+### 4.2 浏览器下载兜底（`downloads.onCreated` / `onDeterminingFilename`）
+
+两个事件按下载 ID 共享 `browserDownloads` 中的同一次处理，最多保留 100 条、15 s。`onDeterminingFilename` 的监听器在顶层同步注册，并同步返回 `true`，在保存位置窗口之前暂缓文件名确定流程；发送成功才取消浏览器副本，失败或不接管时调用一次 `suggest()` 放行原下载。取消成功后不再调用 `suggest()`。
+
+等待上限为 `LIMITS.captureWaitMs`（2.5 s）。超时会先使相关任务失效、将 URL 暂记入 `browserOnlyUrls`，再放行；网络路径和兜底路径都在真正写入 WebSocket 前复核有效性，避免放行后迟到发送。这里的成功只表示 WebSocket 写入未抛错，不代表 NDM 已确认创建任务。
 
 按顺序检查，任一命中即返回：
 
@@ -248,9 +252,10 @@ Cookie: a=b
 | `requestContexts` | 3000 | 按 `requestId` 暂存 POST 体与请求头 |
 | `recentSent` | 500 | 12 s 内的去重 |
 | `pendingCancel` | 100 | 等待浏览器下载事件以取消副本 |
-| `inflightCaptures` | — | 网络路径正在发送的任务 |
+| `inflightCaptures` | — | 网络路径发送任务及其有效性、发送结果 |
+| `browserDownloads` | 100 | 两个下载事件共享的处理结果、保存流程回调；2.5 s 等待、15 s 过期 |
 | `seenHeaderUrls` | — | 12 s 内已见过响应头的 URL |
-| `browserOnlyUrls` | — | RFC 2047 下载，只允许浏览器完成 |
+| `browserOnlyUrls` | 300 | RFC 2047、超限 POST 或接管超时，只允许浏览器完成 |
 | `mediaByTab` | 30/标签 | 媒体面板条目 |
 | `tabInfo` | — | 标签页 URL/标题缓存 |
 | `panelOpenTabs` | — | 面板展开的标签页 |
@@ -539,7 +544,11 @@ content script ── MEDIA_FOUND ─► mediaByTab ──► panel rendering (c
 
 After a successful `sendToNdm()`, the URL is recorded in `recentSent` (12 s dedupe) and `pendingCancel` (15 s, used by the fallback to cancel the browser copy), and `STATE_CHANGED` is broadcast.
 
-### 4.2 Browser download fallback (`downloads.onCreated`)
+### 4.2 Browser download fallback (`downloads.onCreated` / `onDeterminingFilename`)
+
+Both events share one `browserDownloads` entry per download ID (100 entries, 15 s expiry). The filename listener is registered synchronously at module scope and returns the literal `true` to defer filename determination before the save-location prompt. Successful sends cancel the browser copy; failures and declines call `suggest()` once to release the original download. A successful cancellation never calls `suggest()` afterwards.
+
+The wait is bounded by `LIMITS.captureWaitMs` (2.5 s). A timeout invalidates the related task and temporarily records the URL in `browserOnlyUrls` before releasing it. Both automatic send paths re-check eligibility immediately before writing to the WebSocket, preventing late sends after release. Success means the socket write did not throw; it is not an acknowledgement that NDM created a task.
 
 Checked in order; the first hit returns:
 
@@ -673,9 +682,10 @@ Notes:
 | `requestContexts` | 3000 | POST body and headers per `requestId` |
 | `recentSent` | 500 | 12 s dedupe |
 | `pendingCancel` | 100 | waiting for the browser download to cancel |
-| `inflightCaptures` | — | network captures currently sending |
+| `inflightCaptures` | — | network sends, their eligibility and send results |
+| `browserDownloads` | 100 | shared download events and filename callbacks; 2.5 s wait, 15 s expiry |
 | `seenHeaderUrls` | — | URLs whose headers were seen in the last 12 s |
-| `browserOnlyUrls` | — | RFC 2047 downloads that must stay in the browser |
+| `browserOnlyUrls` | 300 | RFC 2047, oversized POST or timed-out takeover; browser only |
 | `mediaByTab` | 30/tab | media panel entries |
 | `tabInfo` | — | tab URL/title cache |
 | `panelOpenTabs` | — | tabs with an expanded panel |

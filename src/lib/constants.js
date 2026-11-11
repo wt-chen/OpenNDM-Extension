@@ -251,6 +251,8 @@ export const LIMITS = Object.freeze({
   contextAgeMs: 45_000,
   recentSent: 500,
   pendingCancel: 100,
+  browserDownloads: 100,
+  captureWaitMs: 2500,
   mediaPerTab: 30,
   recentCaptures: 20,
   bypassTtlMs: 4000,

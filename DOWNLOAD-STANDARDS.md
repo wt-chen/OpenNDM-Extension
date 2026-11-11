@@ -131,6 +131,7 @@ RFC 2047 主要来自非标准邮件/网盘实现（Gmail 附件名是常见例�
 
 ## 5. Chrome / MV3 侧的硬约束
 
+- `downloads.onDeterminingFilename` 支持同步返回 `true` 后异步决定是否放行；Chromium 在该阶段之后才进入保存位置确认。本项目按下载 ID 共享处理，最多等待 2.5 s：发送成功取消原下载，失败/超时放行；取消成功不再 `suggest()`，超时后的迟到任务不得再发送或取消。它只协调保存流程，不暂停网络传输，也不扩大 `decideCapture()` 的接管范围。
 - **观察式 `webRequest` 在 MV3 仍可用**，`webRequestBlocking` 对普通扩展不可用。⇒ 「判定后交给外部程序重取」是唯一合规形态；不要动 `onHeadersReceived` 的返回值（本项目从不返回 `redirectUrl`/`cancel`，取消只走 `chrome.downloads.cancel`）。
 - **监听器必须在 Service Worker 顶层同步注册**，异步/延迟 `import` 之后注册的监听会丢事件（Chromium 已知问题）。我们的三个监听都在模块顶层（[src/background.js:692-755](src/background.js#L692-L755）。
 - `details` 可用字段：`requestId`（跨重定向与鉴权挑战稳定）、`url`、`method`、`type`、`statusCode`、`responseHeaders`、`documentUrl`、`initiator`、`tabId`、`frameId`、`fromCache`、`redirectUrl`。**没有 `download` 这个 type**；`fetch` 与 XHR 都是 `xmlhttprequest`；`<a download>` 在新框架里常报 `other`。
@@ -175,6 +176,8 @@ RFC 2047 主要来自非标准邮件/网盘实现（Gmail 附件名是常见例�
 
 > 编号与 ROADMAP.md 一致。「已闭环」指代码 + 单元测试 + 夹具三者都覆盖，不是只写了代码。
 
+**保存窗口时序补充**：浏览器下载路径已增加 `onDeterminingFilename` 等待与发送前有效性检查，保留发送失败时的原下载；现有规则与夹具断言不变。原生「另存为」窗口需要可见 Chrome 单独验收，不能仅凭下表的单元测试或夹具判定已闭环。
+
 | 编号 | 标准/模式 | 状态 | 现在的处理 |
 | --- | --- | --- | --- |
 | G1 | `Content-Encoding: gzip/br` | **已闭环** | `snapshot` 读 `content-encoding`（[src/background.js:732](src/background.js#L732)）→ `decideCapture()` 里压缩响应的 `size` 强制为 0（[src/lib/rules.js:95-97](src/lib/rules.js#L95-L97)、[:218-226](src/lib/rules.js#L218-L226)），协议上就不发 `7:`；HEAD 探测同样丢弃压缩长度（[src/background.js:584-588](src/background.js#L584-L588)）。不自己解压、不透传编码。夹具 12 双向断言。 |
@@ -193,6 +196,8 @@ RFC 2047 主要来自非标准邮件/网盘实现（Gmail 附件名是常见例�
 ---
 
 ## 9. 场景 ↔ 夹具覆盖矩阵
+
+保存窗口时序不在下面 15 个夹具场景的覆盖范围：需在可见 Chrome 中开启「下载前询问每个文件的保存位置」，分别验证接管成功不弹窗、发送失败/超时能继续浏览器保存、连续下载不重复发送，以及 Ctrl 绕过正常保存；无头模式不能证明原生弹窗已消失。
 
 `node scripts/web-test.mjs --fixtures` 的 15 个场景（[scripts/fixtures.mjs:859-938](scripts/fixtures.mjs#L859-L938)）与上文模式的对应：
 

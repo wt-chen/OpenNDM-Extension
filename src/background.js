@@ -59,6 +59,7 @@ import {
 // 内存状态 / In-memory state.
 const requestContexts = new Map();
 const inflightCaptures = new Map();
+const browserDownloads = new Map();
 const pendingCancel = new Map();
 const recentSent = new Map();
 const seenHeaderUrls = new Map();
@@ -498,16 +499,23 @@ async function sendToNdm(payload, {
   tab = null,
   source = '',
   tabId = null,
-  resourceType = ''
+  resourceType = '',
+  capture = null
 } = {}) {
   if (!payload || !payload.url) return false;
   const url = payload.url;
-  const sent = await ndm.send(payload, { waitMs });
+  const sent = await ndm.send(payload, {
+    waitMs,
+    shouldSend: capture ? () => capture.active && Date.now() < capture.deadline
+      && settings.captureEnabled && (!capture.requiresBrowserTakeover || settings.autoCancelBrowserDownload)
+      && !isBypassed() && !isBrowserOnly(url) : null
+  });
   if (!sent) {
     ndm.ensureConnected();
     return false;
   }
 
+  if (capture) capture.sent = true;
   recentSent.set(url, Date.now() + 12_000);
   pruneExpiring(recentSent, LIMITS.recentSent);
   if (expectBrowserDownload && settings.autoCancelBrowserDownload) {
@@ -865,6 +873,7 @@ async function processHeaders(snapshot) {
   try {
     await ensureInit();
     if (!settings.captureEnabled) return;
+    if (isBrowserOnly(snapshot.url)) return;
     if (!ndm.getState().connected) return;
     if (isBypassed()) return;
 
@@ -965,6 +974,11 @@ async function processHeaders(snapshot) {
 
     // 立即登记 in-flight，供 downloads.onCreated 等待，避免重复发送。
     // Register in-flight immediately so downloads.onCreated can wait instead of sending twice.
+    const capture = {
+      active: true,
+      sent: false,
+      deadline: Date.now() + LIMITS.captureWaitMs
+    };
     const task = (async () => {
       const cookies = await getCookieHeader(snapshot.url, tab?.url || pageUrl);
       const payload = createPayload({
@@ -990,14 +1004,16 @@ async function processHeaders(snapshot) {
         tab,
         source: 'headers',
         tabId: snapshot.tabId,
-        resourceType: snapshot.type
+        resourceType: snapshot.type,
+        capture
       });
     })();
 
-    inflightCaptures.set(snapshot.url, task);
+    capture.promise = task;
+    inflightCaptures.set(snapshot.url, capture);
     void task.catch(() => null).finally(() => {
       setTimeout(() => {
-        if (inflightCaptures.get(snapshot.url) === task) inflightCaptures.delete(snapshot.url);
+        if (inflightCaptures.get(snapshot.url) === capture) inflightCaptures.delete(snapshot.url);
       }, 5000);
     });
     await task;
@@ -1048,12 +1064,17 @@ function markPendingCancel(url) {
 function pruneExpiring(map, limit) {
   const now = Date.now();
   for (const [key, expires] of map) {
-    if (expires <= now) map.delete(key);
+    if ((typeof expires === 'number' ? expires : expires.expires) <= now) {
+      map.delete(key);
+      expires.expire?.();
+    }
   }
   while (map.size > limit) {
     const first = map.keys().next().value;
-    if (!first) break;
+    if (first === undefined) break;
+    const value = map.get(first);
     map.delete(first);
+    value.expire?.();
   }
 }
 
@@ -1062,16 +1083,99 @@ function pruneExpiring(map, limit) {
 /* -------------------------------------------------------------------------- */
 
 chrome.downloads.onCreated.addListener((item) => {
-  void onBrowserDownload(item);
+  if (canTrackBrowserDownload(item)) trackBrowserDownload(item);
 });
+
+// 同步返回 true 才能暂缓保存窗口；不要将监听器声明为 async。
+// Only a literal true defers filename determination; this listener must not be async.
+chrome.downloads.onDeterminingFilename?.addListener((item, suggest) => {
+  if (!canTrackBrowserDownload(item)) {
+    suggest();
+    return;
+  }
+  const download = trackBrowserDownload(item);
+  if (download.status === 'released') {
+    suggest();
+    return;
+  }
+  if (download.status === 'cancelled') return true;
+  download.suggest = suggest;
+  return true;
+});
+
+function canTrackBrowserDownload(item) {
+  if (initialized && (!settings.captureEnabled || !settings.autoCancelBrowserDownload || isBypassed())) return false;
+  return Boolean(item && Number.isInteger(item.id) && isHttpUrl(item.url)
+    && item.byExtensionId !== chrome.runtime.id);
+}
+
+function trackBrowserDownload(item) {
+  pruneExpiring(browserDownloads, LIMITS.browserDownloads);
+  let download = browserDownloads.get(item.id);
+  if (download) {
+    Object.assign(download.item, item);
+    return download;
+  }
+  download = {
+    item: { ...item },
+    requiresBrowserTakeover: true,
+    active: true,
+    sent: false,
+    status: 'pending',
+    deadline: Date.now() + LIMITS.captureWaitMs,
+    expires: Date.now() + LIMITS.browserOnlyMs,
+    suggest: null,
+    capture: null
+  };
+  download.expire = () => finishBrowserDownload(download, false, true);
+  browserDownloads.set(item.id, download);
+  pruneExpiring(browserDownloads, LIMITS.browserDownloads);
+  download.timer = setTimeout(download.expire, LIMITS.captureWaitMs);
+  // 两个事件共享同一次发送与最终决定 / Both events share one send and one final decision.
+  download.promise = onBrowserDownload(download.item, download)
+    .then((sent) => finishBrowserDownload(download, sent))
+    .catch(() => finishBrowserDownload(download, false));
+  return download;
+}
+
+function finishBrowserDownload(download, sent, timedOut = false) {
+  if (download.status !== 'pending') return;
+  clearTimeout(download.timer);
+  const item = download.item;
+  const capture = download.capture || (timedOut
+    ? inflightCaptures.get(item.finalUrl) || inflightCaptures.get(item.url) : null);
+  const takingOver = settings.captureEnabled && settings.autoCancelBrowserDownload && !isBypassed();
+  sent = takingOver && Boolean(sent || download.sent || capture?.sent);
+  download.active = false;
+  if (sent) {
+    download.status = 'cancelling';
+    return cancelDownload(item.id).then((cancelled) => {
+      download.status = cancelled ? 'cancelled' : 'released';
+      if (!cancelled) download.suggest?.();
+      download.suggest = null;
+    });
+  }
+  if (capture && takingOver) capture.active = false;
+  if (timedOut && takingOver) {
+    // 超时先阻止迟到发送，再放行原下载 / Invalidate late sends before releasing the native download.
+    for (const url of [item.url, item.finalUrl]) {
+      if (isHttpUrl(url)) browserOnlyUrls.set(url, Date.now() + LIMITS.browserOnlyMs);
+    }
+    pruneExpiring(browserOnlyUrls, 300);
+  }
+  download.status = 'released';
+  download.suggest?.();
+  download.suggest = null;
+}
 
 /**
  * 接管浏览器原生下载：已由 webRequest 捕获的直接取消，否则补发一次。
  * Take over native downloads: cancel ones already captured, otherwise forward once.
  */
-async function onBrowserDownload(item) {
+async function onBrowserDownload(item, download) {
   try {
     await ensureInit();
+    if (!download.active) return false;
     if (!settings.captureEnabled || !settings.autoCancelBrowserDownload) return;
     if (!item || item.byExtensionId === chrome.runtime.id) return;
     if (!isHttpUrl(item.url)) return;
@@ -1094,20 +1198,17 @@ async function onBrowserDownload(item) {
     // no tab; a missed cancel leaves one copy in NDM and another in the browser.
     const directPending = pendingCancel.get(item.url) || pendingCancel.get(item.finalUrl);
     if (directPending && directPending > Date.now()) {
-      cancelDownload(item.id);
-      return;
+      return true;
     }
 
     const inflight = inflightCaptures.get(item.url) || inflightCaptures.get(item.finalUrl);
     if (inflight) {
-      const sent = await withTimeout(inflight, 2500);
-      if (sent && settings.autoCancelBrowserDownload) cancelDownload(item.id);
-      return;
+      download.capture = inflight;
+      return await withTimeout(inflight.promise, LIMITS.captureWaitMs);
     }
 
     if (isRecentlySent(item.url) || isRecentlySent(item.finalUrl)) {
-      cancelDownload(item.id);
-      return;
+      return true;
     }
     if (!ndm.getState().connected) return;
 
@@ -1135,20 +1236,18 @@ async function onBrowserDownload(item) {
     const seenUntil = Math.max(seenHeaderUrls.get(item.url) || 0, seenHeaderUrls.get(item.finalUrl) || 0);
     if (seenUntil > Date.now()) {
       await new Promise((resolve) => setTimeout(resolve, 600));
+      if (!download.active) return false;
       const latePending = pendingCancel.get(item.url) || pendingCancel.get(item.finalUrl);
       if (latePending && latePending > Date.now()) {
-        cancelDownload(item.id);
-        return;
+        return true;
       }
       const lateInflight = inflightCaptures.get(item.url) || inflightCaptures.get(item.finalUrl);
       if (lateInflight) {
-        const sent = await withTimeout(lateInflight, 2500);
-        if (sent && settings.autoCancelBrowserDownload) cancelDownload(item.id);
-        return;
+        download.capture = lateInflight;
+        return await withTimeout(lateInflight.promise, LIMITS.captureWaitMs);
       }
       if (isRecentlySent(item.url) || isRecentlySent(item.finalUrl)) {
-        cancelDownload(item.id);
-        return;
+        return true;
       }
       // 头部路径没有接管：继续用同一套规则复核这次浏览器下载。
       // The header path did not take it over; fall through and validate this browser download.
@@ -1201,30 +1300,34 @@ async function onBrowserDownload(item) {
       postData: ''
     });
 
-    const sent = await sendToNdm(payload, {
+    return await sendToNdm(payload, {
       expectBrowserDownload: false,
       waitMs: 1200,
       tab,
       source: 'fallback',
       tabId: item.tabId,
-      resourceType: 'download'
+      resourceType: 'download',
+      capture: download
     });
-    if (sent) cancelDownload(item.id);
   } catch (error) {
     console.warn('[OpenNDM] browser download fallback failed', error);
   }
 }
 
 function cancelDownload(id) {
-  if (!Number.isInteger(id)) return;
-  try {
-    chrome.downloads.cancel(id, () => {
-      if (chrome.runtime.lastError) return;
-      chrome.downloads.erase({ id }, () => void chrome.runtime.lastError);
-    });
-  } catch {
-    // 下载可能已经完成 / The download may already be complete.
-  }
+  return new Promise((resolve) => {
+    if (!Number.isInteger(id)) return resolve(false);
+    try {
+      chrome.downloads.cancel(id, () => {
+        if (chrome.runtime.lastError) return resolve(false);
+        resolve(true);
+        chrome.downloads.erase({ id }, () => void chrome.runtime.lastError);
+      });
+    } catch {
+      // 下载可能已经完成 / The download may already be complete.
+      resolve(false);
+    }
+  });
 }
 
 function withTimeout(promise, ms) {
